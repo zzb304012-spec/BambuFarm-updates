@@ -65,12 +65,17 @@ jobs:
           # 不用 mktemp：MSYS /tmp 路径传给 Windows 原生 python 有转换风险，
           # $RUNNER_TEMP 本身是 Windows 路径。
           key_file="$RUNNER_TEMP/manifest_key.pem"
-          trap 'rm -f "$key_file"' EXIT
+          trap 'rm -f "$key_file"; subst B: /d 2>/dev/null || true' EXIT
           printf '%s\n' "$BAMBU_LICENSE_PRIVATE_KEY" > "$key_file"
           # build.py --compile 按名字调 iscc.exe，choco 装的 Inno 不一定进 PATH
           export PATH="/c/Program Files (x86)/Inno Setup 6:$PATH"
+          # pgAdmin 深层路径叠上仓库名两段（D:\a\BambuFarm-updates\BambuFarm-updates）
+          # 会超 Windows MAX_PATH 260，ISCC 打包时报 "cannot find the path specified"。
+          # subst 短盘符把整棵树压回 ~222 字符；B:\ 与 src\ 是同一物理目录，
+          # 后续步骤继续用 src/... 路径取产物不受影响。
+          subst B: "$(cd src && pwd -W)"
           cd src
-          if ! python scripts/build_windows_installer/build_for_customer.py \
+          if ! python B:/scripts/build_windows_installer/build_for_customer.py \
               --fingerprint activation --customer generic \
               --private-key "$key_file" --compile \
               --version "${{ inputs.version }}" > build.log 2>&1; then
