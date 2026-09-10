@@ -73,8 +73,11 @@ jobs:
           # 会超 Windows MAX_PATH 260，ISCC 打包时报 "cannot find the path specified"。
           # 注意 subst 盘符无效：build.py 用 Path(__file__).resolve()，Python 3.8+
           # 会把 subst 盘符还原成真实长路径。必须物理复制源码树到短路径 C:\bfs 构建。
+          # MSYS2_ARG_CONV_EXCL='*' 必须加：Git Bash 会把 /MIR 这类斜杠开关
+          # 当成 POSIX 路径转换成 Windows 路径，robocopy 收到垃圾参数报 rc=16
+          #（已在本机复现 rc=16 并验证加此后 rc=1 正常复制）。
           rc=0
-          robocopy "$(cd src && pwd -W)" 'C:\bfs' /MIR /MT:16 /NFL /NDL /NJH /NJS > /dev/null || rc=$?
+          MSYS2_ARG_CONV_EXCL='*' robocopy "$(cd src && pwd -W)" 'C:\bfs' /MIR /MT:16 /NFL /NDL /NJH /NJS > /dev/null || rc=$?
           if [ "$rc" -gt 7 ]; then
             echo "::error::robocopy 源码树到 C:\bfs 失败 rc=$rc"
             exit 1
