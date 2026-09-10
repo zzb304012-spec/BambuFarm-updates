@@ -65,28 +65,32 @@ jobs:
           # 不用 mktemp：MSYS /tmp 路径传给 Windows 原生 python 有转换风险，
           # $RUNNER_TEMP 本身是 Windows 路径。
           key_file="$RUNNER_TEMP/manifest_key.pem"
-          trap 'rm -f "$key_file"; subst B: /d 2>/dev/null || true' EXIT
+          trap 'rm -f "$key_file"' EXIT
           printf '%s\n' "$BAMBU_LICENSE_PRIVATE_KEY" > "$key_file"
           # build.py --compile 按名字调 iscc.exe，choco 装的 Inno 不一定进 PATH
           export PATH="/c/Program Files (x86)/Inno Setup 6:$PATH"
           # pgAdmin 深层路径叠上仓库名两段（D:\a\BambuFarm-updates\BambuFarm-updates）
           # 会超 Windows MAX_PATH 260，ISCC 打包时报 "cannot find the path specified"。
-          # subst 短盘符把整棵树压回 ~222 字符；B:\ 与 src\ 是同一物理目录，
-          # 后续步骤继续用 src/... 路径取产物不受影响。
-          subst B: "$(cd src && pwd -W)"
-          cd src
-          if ! python B:/scripts/build_windows_installer/build_for_customer.py \
+          # 注意 subst 盘符无效：build.py 用 Path(__file__).resolve()，Python 3.8+
+          # 会把 subst 盘符还原成真实长路径。必须物理复制源码树到短路径 C:\bfs 构建。
+          rc=0
+          robocopy "$(cd src && pwd -W)" 'C:\bfs' /MIR /MT:16 /NFL /NDL /NJH /NJS > /dev/null || rc=$?
+          if [ "$rc" -gt 7 ]; then
+            echo "::error::robocopy 源码树到 C:\bfs 失败 rc=$rc"
+            exit 1
+          fi
+          if ! python C:/bfs/scripts/build_windows_installer/build_for_customer.py \
               --fingerprint activation --customer generic \
               --private-key "$key_file" --compile \
               --version "${{ inputs.version }}" > build.log 2>&1; then
             echo "::error::构建失败。日志含源码信息已脱敏：下载 artifact 中的 build.log.enc，用维护者密码 openssl 解密查看"
             exit 1
           fi
-          if [ ! -f scripts/build_windows_installer/stage/runtime/integrity_manifest.sig ]; then
+          if [ ! -f C:/bfs/scripts/build_windows_installer/stage/runtime/integrity_manifest.sig ]; then
             echo "::error::完整性清单签名缺失（integrity_manifest.sig），客户机会拒绝启动"
             exit 1
           fi
-          if [ ! -f scripts/build_windows_installer/dist/BambuFarm-Setup.exe ]; then
+          if [ ! -f C:/bfs/scripts/build_windows_installer/dist/BambuFarm-Setup.exe ]; then
             echo "::error::安装包 exe 未产出"
             exit 1
           fi
@@ -99,8 +103,8 @@ jobs:
           BUILD_LOG_PASSWORD: ${{ secrets.BUILD_LOG_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ -f src/build.log ]; then
-            openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$BUILD_LOG_PASSWORD" -in src/build.log -out build.log.enc
+          if [ -f build.log ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$BUILD_LOG_PASSWORD" -in build.log -out build.log.enc
             echo "log encrypted"
           fi
 
@@ -122,7 +126,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="windows-installer"
-          exe="src/scripts/build_windows_installer/dist/BambuFarm-Setup.exe"
+          exe="C:/bfs/scripts/build_windows_installer/dist/BambuFarm-Setup.exe"
           if ! gh release view "$tag" -R zzb304012-spec/BambuFarm-updates >/dev/null 2>&1; then
             gh release create "$tag" -R zzb304012-spec/BambuFarm-updates \
               --title "BambuFarm Windows 安装包" \
@@ -148,5 +152,5 @@ jobs:
           curl -fsS --max-time 1800 -X POST "http://47.114.49.156:2445/api/internal/updates/upload" \
             -H "X-Internal-Token: $CENTER_INTERNAL_TOKEN" \
             -F "version=${{ inputs.version }}" \
-            -F "installer=@src/scripts/build_windows_installer/dist/BambuFarm-Setup.exe"
+            -F "installer=@C:/bfs/scripts/build_windows_installer/dist/BambuFarm-Setup.exe"
           echo "vps upload OK"
