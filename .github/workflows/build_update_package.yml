@@ -122,6 +122,27 @@ jobs:
           fi
           echo "release OK"
 
+      # 推送到自有更新服务器（VPS）：客户机更新源主通道，国内直连。
+      # token 只保护上传端点；包本身必须 RSA 签名客户机才接受，链路安全由签名兜底。
+      - name: Upload to self-hosted update server (VPS)
+        shell: bash
+        env:
+          CENTER_INTERNAL_TOKEN: ${{ secrets.CENTER_INTERNAL_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CENTER_INTERNAL_TOKEN" ]; then
+            echo "::error::secret CENTER_INTERNAL_TOKEN 未配置，无法推送自有更新服务器"
+            exit 1
+          fi
+          cd src/scripts/build_windows_installer/dist
+          curl -fsS --max-time 300 -X POST "http://47.114.49.156:2445/api/internal/updates/upload" \
+            -H "X-Internal-Token: $CENTER_INTERNAL_TOKEN" \
+            -F "version=${{ inputs.version }}" \
+            -F "notes=${{ inputs.notes }}" \
+            -F "zip=@BambuFarm-Update.zip" \
+            -F "sig=@BambuFarm-Update.zip.sig"
+          echo "vps upload OK"
+
       # VERSION 必须永远等于最新增量包版本，否则新装客户机首启会现场更新重启。
       - name: Sync installer VERSION back to private repo
         shell: bash
