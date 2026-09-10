@@ -135,10 +135,15 @@ jobs:
             exit 1
           fi
           cd src/scripts/build_windows_installer/dist
+          # 中文 notes 走文件传递：Windows Git Bash 下 curl 命令行参数带非 ASCII
+          # 会被 MSYS 转码损坏（实测 notes 变问号），从文件读字节原样发送
+          notes_file="$(mktemp)"
+          trap 'rm -f "$notes_file"' EXIT
+          printf '%s' "${{ inputs.notes }}" > "$notes_file"
           curl -fsS --max-time 300 -X POST "http://47.114.49.156:2445/api/internal/updates/upload" \
             -H "X-Internal-Token: $CENTER_INTERNAL_TOKEN" \
             -F "version=${{ inputs.version }}" \
-            -F "notes=${{ inputs.notes }}" \
+            -F "notes=<$notes_file" \
             -F "zip=@BambuFarm-Update.zip" \
             -F "sig=@BambuFarm-Update.zip.sig"
           echo "vps upload OK"

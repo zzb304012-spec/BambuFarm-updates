@@ -1,0 +1,147 @@
+name: Build Windows Installer
+
+# 公开仓库免费构建版：完整 Windows 安装包（激活码通用模式，无机器码绑定，
+# 客户机首启走在线激活界面）。公开仓库 Actions 不限分钟数，构建永久免费。
+# 用 SRC_PAT 拉私有源码库 BambuFarm-win 编译，构建输出全程重定向到 build.log
+# 不上屏——公开仓库的构建日志任何人可见，编译输出会暴露源码文件结构。
+# 构建失败时日志用 BUILD_LOG_PASSWORD 加密后传 artifact，维护者本地解密：
+#   openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:"<密码>" -in build.log.enc -out build.log
+# 产物 BambuFarm-Setup.exe 两个出口：
+#   1. 本仓库 Release（tag 固定 windows-installer，直链不变，--clobber 覆盖）
+#   2. 自有更新服务器 VPS（/api/updates/download/BambuFarm-Setup.exe 固定直链，国内快）
+# 不回推 VERSION——VERSION 永远等于最新增量包版本，由增量包 workflow 管理。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "安装包版本号（应与当前最新增量包版本一致，如 1.0.10）"
+        required: true
+      src_ref:
+        description: "私有源码库分支/提交（默认 main）"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: zzb304012-spec/BambuFarm-win
+          token: ${{ secrets.SRC_PAT }}
+          path: src
+          ref: ${{ inputs.src_ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Install build dependencies
+        run: pip install cryptography
+
+      # --fingerprint activation = 激活码通用包（不预置 lic，首启在线激活）。
+      # --compile 一并做 Nuitka 加固（启动器 + web 业务层 .pyd）并调 iscc 出 exe。
+      # --private-key 签运行时完整性清单：缺 integrity_manifest.sig 客户机拒绝启动，必须强制。
+      - name: Build installer (silenced)
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          BAMBU_LICENSE_PRIVATE_KEY: ${{ secrets.BAMBU_LICENSE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BAMBU_LICENSE_PRIVATE_KEY" ]; then
+            echo "::error::secret BAMBU_LICENSE_PRIVATE_KEY 未配置，无法签完整性清单"
+            exit 1
+          fi
+          # 不用 mktemp：MSYS /tmp 路径传给 Windows 原生 python 有转换风险，
+          # $RUNNER_TEMP 本身是 Windows 路径。
+          key_file="$RUNNER_TEMP/manifest_key.pem"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s\n' "$BAMBU_LICENSE_PRIVATE_KEY" > "$key_file"
+          # build.py --compile 按名字调 iscc.exe，choco 装的 Inno 不一定进 PATH
+          export PATH="/c/Program Files (x86)/Inno Setup 6:$PATH"
+          cd src
+          if ! python scripts/build_windows_installer/build_for_customer.py \
+              --fingerprint activation --customer generic \
+              --private-key "$key_file" --compile \
+              --version "${{ inputs.version }}" > build.log 2>&1; then
+            echo "::error::构建失败。日志含源码信息已脱敏：下载 artifact 中的 build.log.enc，用维护者密码 openssl 解密查看"
+            exit 1
+          fi
+          if [ ! -f scripts/build_windows_installer/stage/runtime/integrity_manifest.sig ]; then
+            echo "::error::完整性清单签名缺失（integrity_manifest.sig），客户机会拒绝启动"
+            exit 1
+          fi
+          if [ ! -f scripts/build_windows_installer/dist/BambuFarm-Setup.exe ]; then
+            echo "::error::安装包 exe 未产出"
+            exit 1
+          fi
+          echo "build OK (log silenced, $(wc -l < build.log) lines)"
+
+      - name: Encrypt build log on failure
+        if: failure()
+        shell: bash
+        env:
+          BUILD_LOG_PASSWORD: ${{ secrets.BUILD_LOG_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -f src/build.log ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$BUILD_LOG_PASSWORD" -in src/build.log -out build.log.enc
+            echo "log encrypted"
+          fi
+
+      - name: Upload encrypted log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: installer-build-log-${{ github.run_id }}
+          path: build.log.enc
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # tag 固定 windows-installer + --clobber：直链永远指向最新安装包。
+      - name: Publish to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="windows-installer"
+          exe="src/scripts/build_windows_installer/dist/BambuFarm-Setup.exe"
+          if ! gh release view "$tag" -R zzb304012-spec/BambuFarm-updates >/dev/null 2>&1; then
+            gh release create "$tag" -R zzb304012-spec/BambuFarm-updates \
+              --title "BambuFarm Windows 安装包" \
+              --notes "激活码通用安装包，资产永远是最新构建（看上传日期）。版本号以安装后 关于/检查更新 页面为准。" \
+              --latest=false
+          fi
+          gh release upload "$tag" "$exe" -R zzb304012-spec/BambuFarm-updates --clobber
+          echo "release OK"
+
+      # 推送到自有更新服务器（VPS）：国内客户下载主通道。
+      # token 只保护上传端点；安装包本身是公开分发物，无敏感内容。
+      # ~440MB 跨国上传可能较慢，--max-time 放宽到 30 分钟。
+      - name: Upload to self-hosted update server (VPS)
+        shell: bash
+        env:
+          CENTER_INTERNAL_TOKEN: ${{ secrets.CENTER_INTERNAL_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CENTER_INTERNAL_TOKEN" ]; then
+            echo "::error::secret CENTER_INTERNAL_TOKEN 未配置，无法推送自有更新服务器"
+            exit 1
+          fi
+          curl -fsS --max-time 1800 -X POST "http://47.114.49.156:2445/api/internal/updates/upload" \
+            -H "X-Internal-Token: $CENTER_INTERNAL_TOKEN" \
+            -F "version=${{ inputs.version }}" \
+            -F "installer=@src/scripts/build_windows_installer/dist/BambuFarm-Setup.exe"
+          echo "vps upload OK"
