@@ -1,0 +1,140 @@
+name: Build Update Package
+
+# 公开仓库免费构建版（公开仓库 Actions 不限分钟数，构建永久免费）。
+# 用 SRC_PAT 拉私有源码库 BambuFarm-win 编译，构建/编译输出全程重定向到
+# build.log 不上屏——公开仓库的构建日志任何人可见，编译输出会暴露源码文件结构。
+# 构建失败时日志用 BUILD_LOG_PASSWORD 加密后传 artifact（公开仓库 artifact 任何
+# 登录用户可下载，加密后才能放），维护者本地解密：
+#   openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:"<密码>" -in build.log.enc -out build.log
+# 产物 zip+sig 发本仓库 Release（GITHUB_TOKEN 即可），VERSION 回推私有库。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "新版本号（如 1.0.8），必须高于客户机 version.txt"
+        required: true
+      notes:
+        description: "更新说明（展示在检查更新结果里）"
+        required: false
+        default: ""
+      src_ref:
+        description: "私有源码库分支/提交（默认 main）"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+jobs:
+  build-update:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: zzb304012-spec/BambuFarm-win
+          token: ${{ secrets.SRC_PAT }}
+          path: src
+          ref: ${{ inputs.src_ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 编译输出含全部源码文件名，必须进日志文件，只允许打印固定结论。
+      - name: Build update package (silenced)
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          set -euo pipefail
+          cd src
+          if ! python scripts/build_windows_installer/build.py --update-zip --compile-web --version "${{ inputs.version }}" > build.log 2>&1; then
+            echo "::error::构建失败。日志含源码信息已脱敏：下载 artifact 中的 build.log.enc，用维护者密码 openssl 解密查看"
+            exit 1
+          fi
+          echo "build OK (log silenced, $(wc -l < build.log) lines)"
+
+      # 用 RSA 私钥（secret UPDATES_SIGNING_KEY，PEM 文本）给更新包签名：
+      # RSASSA-PKCS1-v1_5 / SHA-256，产出 raw 签名字节 BambuFarm-Update.zip.sig。
+      # 新版客户端 updater 验签失败/缺 sig 一律拒绝应用，所以签名必须强制。
+      - name: Sign update package
+        shell: bash
+        env:
+          UPDATES_SIGNING_KEY: ${{ secrets.UPDATES_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$UPDATES_SIGNING_KEY" ]; then
+            echo "::error::secret UPDATES_SIGNING_KEY 未配置，无法签名更新包"
+            exit 1
+          fi
+          key_file="$(mktemp)"
+          pub_file="$(mktemp)"
+          trap 'rm -f "$key_file" "$pub_file"' EXIT
+          printf '%s\n' "$UPDATES_SIGNING_KEY" > "$key_file"
+          cd src/scripts/build_windows_installer/dist
+          openssl dgst -sha256 -sign "$key_file" -out BambuFarm-Update.zip.sig BambuFarm-Update.zip
+          # 不能用进程替换 <(...)：Windows Git Bash 产出 /proc/pid/fd 路径，
+          # Windows 原生 openssl.exe 读不了。
+          openssl rsa -in "$key_file" -pubout -out "$pub_file" 2>/dev/null
+          openssl dgst -sha256 -verify "$pub_file" -signature BambuFarm-Update.zip.sig BambuFarm-Update.zip
+          echo "sign OK"
+
+      - name: Encrypt build log on failure
+        if: failure()
+        shell: bash
+        env:
+          BUILD_LOG_PASSWORD: ${{ secrets.BUILD_LOG_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -f src/build.log ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$BUILD_LOG_PASSWORD" -in src/build.log -out build.log.enc
+            echo "log encrypted"
+          fi
+
+      - name: Upload encrypted log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: build-log-${{ github.run_id }}
+          path: build.log.enc
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Publish to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="v${{ inputs.version }}"
+          zip="src/scripts/build_windows_installer/dist/BambuFarm-Update.zip"
+          sig="src/scripts/build_windows_installer/dist/BambuFarm-Update.zip.sig"
+          notes="${{ inputs.notes }}"
+          [ -z "$notes" ] && notes="BambuFarm $tag 增量更新包"
+          if ! gh release view "$tag" -R zzb304012-spec/BambuFarm-updates >/dev/null 2>&1; then
+            gh release create "$tag" "$zip" "$sig" -R zzb304012-spec/BambuFarm-updates --title "BambuFarm $tag" --notes "$notes"
+          else
+            gh release upload "$tag" "$zip" "$sig" -R zzb304012-spec/BambuFarm-updates --clobber
+          fi
+          echo "release OK"
+
+      # VERSION 必须永远等于最新增量包版本，否则新装客户机首启会现场更新重启。
+      - name: Sync installer VERSION back to private repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          ver="${{ inputs.version }}"
+          if [ "$(cat scripts/build_windows_installer/VERSION)" != "$ver" ]; then
+            printf '%s' "$ver" > scripts/build_windows_installer/VERSION
+            git add scripts/build_windows_installer/VERSION
+            git commit -m "chore: sync installer VERSION to $ver [skip ci]" >/dev/null
+            git push origin HEAD:main 2>&1 | sed -E 's/(ghp_|github_pat_)[A-Za-z0-9_]+/[REDACTED]/g'
+          fi
+          echo "version sync done"
