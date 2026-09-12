@@ -59,18 +59,35 @@ jobs:
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
 
+      - name: Install Python signing deps
+        run: pip install cryptography
+
       # 编译/打包输出含全部源码文件名，必须进日志文件，只允许打印固定结论。
       - name: Build installer stage + Inno compile (silenced)
         shell: bash
         env:
           PYTHONUTF8: "1"
+          BAMBU_LICENSE_PRIVATE_KEY: ${{ secrets.BAMBU_LICENSE_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           cd /c/bf
-          if ! python scripts/build_windows_installer/build.py --version "${{ inputs.version }}" > build.log 2>&1; then
+          # 授权私钥同时用于完整性清单签名（start.py 用内嵌公钥验签，缺 .sig 拒绝启动）。
+          # 私钥只落 runner 本地文件，内容不进日志，步骤结束即删。
+          if [ -z "$BAMBU_LICENSE_PRIVATE_KEY" ]; then
+            echo "::error::secret BAMBU_LICENSE_PRIVATE_KEY 未配置，无法签名完整性清单"
+            exit 1
+          fi
+          printf '%s\n' "$BAMBU_LICENSE_PRIVATE_KEY" > manifest_key.pem
+          trap 'rm -f manifest_key.pem' EXIT
+          # --compile-launcher/--compile-web：编译启动器 exe + web .pyd（缺 exe 首启退源码模式）；
+          # --manifest-signing-key：签名完整性清单。三个参数缺一个，打出的包就无法启动。
+          if ! python scripts/build_windows_installer/build.py --version "${{ inputs.version }}" --compile-launcher --compile-web --manifest-signing-key "C:/bf/manifest_key.pem" > build.log 2>&1; then
             echo "::error::安装包 stage 构建失败。日志含源码信息已脱敏：下载 artifact 中的 build.log.enc，用维护者密码 openssl 解密查看"
             exit 1
           fi
+          # 硬性卡点：关键产物缺失直接判失败，不允许再打出"起不来"的包（2026-09-12 事故）
+          test -f scripts/build_windows_installer/stage/runtime/bambufarm_start.exe || { echo "::error::stage 缺 bambufarm_start.exe"; exit 1; }
+          test -f scripts/build_windows_installer/stage/runtime/integrity_manifest.sig || { echo "::error::stage 缺 integrity_manifest.sig"; exit 1; }
           if ! "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" scripts/build_windows_installer/stage/BambuFarmSetup.iss >> build.log 2>&1; then
             echo "::error::Inno 编译失败。日志含源码信息已脱敏：下载 artifact 中的 build.log.enc，用维护者密码 openssl 解密查看"
             exit 1
