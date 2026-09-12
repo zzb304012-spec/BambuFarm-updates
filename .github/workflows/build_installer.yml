@@ -1,0 +1,101 @@
+name: Build Customer Installer
+
+# 公开仓库免费构建客户完整安装包（公开仓库 Actions 不限分钟数，永久免费）。
+# 与 Build Update Package 同一套脱敏纪律：构建/Inno 输出全部进 build.log 不上屏
+# （公开仓库日志任何人可见，编译输出会暴露源码文件结构）；失败时日志用
+# BUILD_LOG_PASSWORD 加密传 artifact，维护者本地解密：
+#   openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:"<密码>" -in build.log.enc -out build.log
+# 产物 BambuFarm-Setup.exe 发本仓库 Release（tag: windows-installer，稳定直链），
+# VPS 侧用 bf_par_dl.py 拉取替换 /opt/bambufarm/system/static/dl/ 分发文件。
+# 安装包不带机器码授权（激活码流程），构建无需任何 license 输入。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "安装包版本号（须与私有库 VERSION 一致，如 1.0.23）"
+        required: true
+      src_ref:
+        description: "私有源码库分支/提交（默认 main）"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: zzb304012-spec/BambuFarm-win
+          token: ${{ secrets.SRC_PAT }}
+          path: src
+          ref: ${{ inputs.src_ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      # 编译/打包输出含全部源码文件名，必须进日志文件，只允许打印固定结论。
+      - name: Build installer stage + Inno compile (silenced)
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          set -euo pipefail
+          cd src
+          if ! python scripts/build_windows_installer/build.py --version "${{ inputs.version }}" > build.log 2>&1; then
+            echo "::error::安装包 stage 构建失败。日志含源码信息已脱敏：下载 artifact 中的 build.log.enc，用维护者密码 openssl 解密查看"
+            exit 1
+          fi
+          if ! "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" scripts/build_windows_installer/stage/BambuFarmSetup.iss >> build.log 2>&1; then
+            echo "::error::Inno 编译失败。日志含源码信息已脱敏：下载 artifact 中的 build.log.enc，用维护者密码 openssl 解密查看"
+            exit 1
+          fi
+          exe=$(ls scripts/build_windows_installer/dist/*.exe | head -1)
+          echo "build OK (log silenced, $(wc -l < build.log) lines, installer $(stat -c%s "$exe") bytes)"
+
+      - name: Encrypt build log on failure
+        if: failure()
+        shell: bash
+        env:
+          BUILD_LOG_PASSWORD: ${{ secrets.BUILD_LOG_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -f src/build.log ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$BUILD_LOG_PASSWORD" -in src/build.log -out build.log.enc
+            echo "log encrypted"
+          fi
+
+      - name: Upload encrypted log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: installer-log-${{ github.run_id }}
+          path: build.log.enc
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Publish installer to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="windows-installer"
+          exe=$(ls src/scripts/build_windows_installer/dist/*.exe | head -1)
+          cp "$exe" BambuFarm-Setup.exe
+          if ! gh release view "$tag" -R zzb304012-spec/BambuFarm-updates >/dev/null 2>&1; then
+            gh release create "$tag" BambuFarm-Setup.exe -R zzb304012-spec/BambuFarm-updates --title "BambuFarm Windows 客户安装包" --notes "完整安装包（激活码流程，免机器码）"
+          else
+            gh release upload "$tag" BambuFarm-Setup.exe -R zzb304012-spec/BambuFarm-updates --clobber
+          fi
+          echo "release OK"
