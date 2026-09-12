@@ -8,6 +8,11 @@ name: Build Customer Installer
 # 产物 BambuFarm-Setup.exe 发本仓库 Release（tag: windows-installer，稳定直链），
 # VPS 侧用 bf_par_dl.py 拉取替换 /opt/bambufarm/system/static/dl/ 分发文件。
 # 安装包不带机器码授权（激活码流程），构建无需任何 license 输入。
+#
+# 注意：不用 actions/checkout——workspace 路径 D:\a\BambuFarm-updates\BambuFarm-updates\src
+# 前缀 45 字符，叠上 stage 内 pgAdmin 深嵌套路径后超 Windows 260 字符上限，
+# ISCC 编译中途报 "The system cannot find the path specified"（2026-09-12 实测）。
+# 改为手动 clone 到 C:\bf 短路径；token 走 insteadOf 重写，命令行/日志不出现凭证。
 
 on:
   workflow_dispatch:
@@ -27,13 +32,24 @@ jobs:
   build-installer:
     runs-on: windows-latest
     steps:
-      - name: Checkout private source
-        uses: actions/checkout@v4
-        with:
-          repository: zzb304012-spec/BambuFarm-win
-          token: ${{ secrets.SRC_PAT }}
-          path: src
-          ref: ${{ inputs.src_ref }}
+      - name: Clone private source to short path C:\bf
+        shell: bash
+        env:
+          SRC_PAT: ${{ secrets.SRC_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SRC_PAT" ]; then
+            echo "::error::secret SRC_PAT 未配置，无法拉取私有源码"
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${SRC_PAT}@github.com/".insteadOf "https://github.com/"
+          git clone --quiet --depth 1 https://github.com/zzb304012-spec/BambuFarm-win.git /c/bf
+          ref="${{ inputs.src_ref }}"
+          if [ -n "$ref" ] && [ "$ref" != "main" ]; then
+            git -C /c/bf fetch --quiet --depth 1 origin "$ref"
+            git -C /c/bf checkout --quiet FETCH_HEAD
+          fi
+          git -C /c/bf log --oneline -1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -50,7 +66,7 @@ jobs:
           PYTHONUTF8: "1"
         run: |
           set -euo pipefail
-          cd src
+          cd /c/bf
           if ! python scripts/build_windows_installer/build.py --version "${{ inputs.version }}" > build.log 2>&1; then
             echo "::error::安装包 stage 构建失败。日志含源码信息已脱敏：下载 artifact 中的 build.log.enc，用维护者密码 openssl 解密查看"
             exit 1
@@ -69,8 +85,8 @@ jobs:
           BUILD_LOG_PASSWORD: ${{ secrets.BUILD_LOG_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ -f src/build.log ]; then
-            openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$BUILD_LOG_PASSWORD" -in src/build.log -out build.log.enc
+          if [ -f /c/bf/build.log ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$BUILD_LOG_PASSWORD" -in /c/bf/build.log -out build.log.enc
             echo "log encrypted"
           fi
 
@@ -91,7 +107,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="windows-installer"
-          exe=$(ls src/scripts/build_windows_installer/dist/*.exe | head -1)
+          exe=$(ls /c/bf/scripts/build_windows_installer/dist/*.exe | head -1)
           cp "$exe" BambuFarm-Setup.exe
           if ! gh release view "$tag" -R zzb304012-spec/BambuFarm-updates >/dev/null 2>&1; then
             gh release create "$tag" BambuFarm-Setup.exe -R zzb304012-spec/BambuFarm-updates --title "BambuFarm Windows 客户安装包" --notes "完整安装包（激活码流程，免机器码）"
